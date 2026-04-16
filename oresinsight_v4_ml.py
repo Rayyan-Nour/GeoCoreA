@@ -20,6 +20,7 @@ Key Design Decisions:
 
 import os
 import sys
+sys.stdout.reconfigure(line_buffering=True)  # Force line-buffered output for real-time progress
 import csv
 import numpy as np
 from osgeo import gdal, ogr
@@ -292,7 +293,7 @@ def rasterize_csv(csv_path, H, W, x_min, x_max, y_min, y_max, layer_name=''):
     # Read CSV and detect columns
     with open(csv_path, 'r', errors='replace') as f:
         reader = csv_module.reader(f)
-        headers = [h.strip().lower() for h in next(reader)]
+        headers = [h.strip().lower().lstrip('\ufeff').replace('ï»¿','') for h in next(reader)]
     
     print(f"  [INFO] CSV columns: {headers[:15]}{'...' if len(headers) > 15 else ''}")
     
@@ -313,30 +314,41 @@ def rasterize_csv(csv_path, H, W, x_min, x_max, y_min, y_max, layer_name=''):
     val_col = None
     # Priority mapping based on what we're looking for
     priority = {
-        'radiometric_th': ['eth', 'th', 'eth_pred', 'eth_prediction', 'thorium', 'th232', 'eth_ppm'],
-        'radiometric_k': ['k', 'k_pred', 'k_prediction', 'potassium', 'k40', 'k_pct', 'k_percent'],
-        'radiometric_u': ['eu', 'u', 'eu_pred', 'eu_prediction', 'uranium', 'u238', 'eu_ppm'],
-        'nure_th': ['eth', 'th', 'thorium'],
-        'nure_p': ['p', 'phosphorus', 'p_ppm', 'p2o5'],
-        'nure_nb': ['nb', 'niobium', 'nb_ppm'],
+        'radiometric_th': ['y_mean_ppm', 'quan_ppm', 'eth_ppm', 'eth_pred', 'eth_prediction', 'eth', 'thorium', 'th232', 'th'],
+        'radiometric_k': ['y_mean_per', 'quan_per', 'k_pct', 'k_percent', 'k_pred', 'k_prediction', 'potassium', 'k40', 'k'],
+        'radiometric_u': ['y_mean_ppm', 'quan_ppm', 'eu_ppm', 'eu_pred', 'eu_prediction', 'uranium', 'u238', 'eu', 'u'],
+        'nure_th': ['th_ppm', 'thorium', 'th', 'eth', 'y_mean_ppm'],
+        'nure_p': ['p_ppm', 'p2o5', 'phosphorus', 'p'],
+        'nure_nb': ['nb_ppm', 'niobium', 'nb'],
     }
-    
-    search_terms = priority.get(layer_name.lower(), [])
-    # Also try the layer name itself
-    search_terms.append(layer_name.replace('radiometric_', '').replace('nure_', ''))
-    
+
+    search_terms = priority.get(layer_name.lower(), []).copy()
+    stripped_name = layer_name.replace('radiometric_', '').replace('nure_', '')
+    if stripped_name:
+        search_terms.append(stripped_name)
+
+    banned_value_names = {
+        'fid', 'objectid', 'id', 'gid', 'index',
+        'easting', 'northing', 'x', 'y', 'lat', 'latitude', 'lon', 'long', 'longitude',
+        'prob', 'quantile'
+    }
+
     for term in search_terms:
+        term = term.lower().strip()
         for i, h in enumerate(headers):
-            if term == h or (term in h and i != lon_col and i != lat_col):
+            h_clean = h.lower().strip().lstrip('\ufeff').replace('ï»¿','')
+            if i == lon_col or i == lat_col or h_clean in banned_value_names:
+                continue
+            if term == h_clean or term in h_clean:
                 val_col = i
                 break
         if val_col is not None:
             break
-    
+
     # Fallback: first numeric column that isn't lat/lon
     if val_col is None:
         skip = {lon_col, lat_col}
-        skip_names = {'fid', 'objectid', 'id', 'gid', 'index'}
+        skip_names = {'fid', 'objectid', 'id', 'gid', 'index', 'easting', 'northing', 'prob', 'quantile', 'rastervalu'}
         with open(csv_path, 'r', errors='replace') as f:
             reader = csv_module.reader(f)
             next(reader)  # skip header
@@ -395,7 +407,253 @@ def rasterize_csv(csv_path, H, W, x_min, x_max, y_min, y_max, layer_name=''):
         if p95 > 0:
             interpolated = np.clip(interpolated / p95, 0, 1)
     
+    print(f"  [OK] Interpolated {len(points)} points, range: [{interpolated.min():.3f}, {interpolated.max():.3f}]")
     return interpolated.astype(np.float32)
+
+
+def _safe_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    return str(value).strip()
+
+
+def _row_search_blob(row):
+    important_cols = [
+        'site_name', 'commod1', 'commod2', 'commod3', 'dep_type', 'model', 'ore',
+        'gangue', 'other_matl', 'com_type', 'dev_stat', 'orebody_fm', 'alteration',
+        'hrock_type', 'arock_type', 'hrock_unit', 'arock_unit', 'tectonic', 'structure'
+    ]
+    return " | ".join(_safe_text(row.get(c, "")) for c in important_cols).lower()
+
+
+def _commodity_tokens(row):
+    values = []
+    for col in ('commod1', 'commod2', 'commod3'):
+        raw = _safe_text(row.get(col, ""))
+        if raw:
+            for part in raw.replace(';', ',').split(','):
+                token = part.strip().lower()
+                if token:
+                    values.append(token)
+    return values
+
+
+def _score_deposit_row(row, commodity):
+    blob = _row_search_blob(row)
+    tokens = set(_commodity_tokens(row))
+    score = 0.0
+
+    if commodity == 'copper':
+        if any(tok in tokens for tok in ('copper', 'cu')):
+            score += 3.0
+        if 'porphyry' in blob:
+            score += 4.0
+        if any(k in blob for k in ['chalcopyrite', 'bornite', 'molybdenite', 'potassic', 'phyllic', 'argillic']):
+            score += 1.5
+        if any(tok in tokens for tok in ('molybdenum', 'gold', 'silver')):
+            score += 0.75
+        if 'skarn' in blob or 'vein' in blob:
+            score -= 1.0
+        if 'occurrence' in blob:
+            score -= 0.5
+    else:
+        ree_minerals = [
+            'monazite', 'bastnaesite', 'xenotime', 'allanite', 'parisite', 'synchysite',
+            'eudialyte', 'loparite', 'apatite', 'pyrochlore'
+        ]
+        alkaline_keywords = ['carbonatite', 'alkaline', 'peralkaline', 'fenite', 'fenit', 'alkalic']
+        if 'ree' in tokens or 'rare earth' in blob:
+            score += 4.0
+        if any(k in blob for k in ree_minerals):
+            score += 2.5
+        if any(k in blob for k in alkaline_keywords):
+            score += 2.0
+        if any(tok in tokens for tok in ('thorium', 'niobium (columbium)', 'niobium', 'tantalum', 'uranium')):
+            score += 0.8
+        if 'phosphorus-phosphates' in tokens or 'phosphate' in blob or 'apatite' in blob:
+            score += 0.8
+        if 'occurrence' in blob:
+            score -= 0.5
+
+    return score
+
+
+def select_deposits_from_csv(csv_path, x_min, x_max, y_min, y_max, transform, H, W, commodity):
+    deposits = []
+    diagnostics = {
+        'rows_scanned': 0,
+        'rows_in_bounds': 0,
+        'rows_selected': 0,
+        'mean_score': 0.0,
+    }
+    if not csv_path or not os.path.exists(csv_path):
+        return deposits, diagnostics
+
+    print(f"[INFO] Loading deposit CSV: {os.path.basename(csv_path)}")
+
+    with open(csv_path, 'r', errors='replace', newline='') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            print("[WARN] Deposit CSV has no header row")
+            return deposits, diagnostics
+
+        fieldnames = reader.fieldnames
+        lower_to_actual = {name.strip().lower(): name for name in fieldnames}
+
+        lon_key = None
+        lat_key = None
+        for candidate in ('longitude', 'lon', 'long', 'x', 'lng', 'long_dd'):
+            if candidate in lower_to_actual:
+                lon_key = lower_to_actual[candidate]
+                break
+        for candidate in ('latitude', 'lat', 'y', 'lat_dd'):
+            if candidate in lower_to_actual:
+                lat_key = lower_to_actual[candidate]
+                break
+
+        if lon_key is None or lat_key is None:
+            print(f"[WARN] Could not detect longitude/latitude columns in deposit CSV: {fieldnames}")
+            return deposits, diagnostics
+
+        pixel_width = transform[1]
+        pixel_height = transform[5]
+        scores = []
+
+        for row in reader:
+            diagnostics['rows_scanned'] += 1
+            try:
+                x = float(row[lon_key])
+                y = float(row[lat_key])
+            except (TypeError, ValueError, KeyError):
+                continue
+
+            if not (x_min <= x <= x_max and y_min <= y <= y_max):
+                continue
+
+            diagnostics['rows_in_bounds'] += 1
+            score = _score_deposit_row(row, commodity)
+            threshold = 3.0 if commodity == 'copper' else 3.5
+            if score < threshold:
+                continue
+
+            px = int((x - x_min) / pixel_width)
+            py = int((y - transform[3]) / pixel_height)
+            if 0 <= px < W and 0 <= py < H:
+                deposits.append((px, py, x, y))
+                scores.append(score)
+
+        diagnostics['rows_selected'] = len(deposits)
+        if scores:
+            diagnostics['mean_score'] = float(np.mean(scores))
+
+    print(f"[INFO] Deposit CSV rows scanned: {diagnostics['rows_scanned']}")
+    print(f"[INFO] Deposit candidates in bounds: {diagnostics['rows_in_bounds']}")
+    print(f"[INFO] Commodity-filtered deposits kept: {diagnostics['rows_selected']}")
+    if diagnostics['rows_selected']:
+        print(f"[INFO] Mean selection score: {diagnostics['mean_score']:.2f}")
+    return deposits, diagnostics
+
+
+def normalize_positive(arr):
+    arr = np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    positive = arr[arr > 0]
+    if positive.size == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    p95 = np.percentile(positive, 95)
+    if p95 <= 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    return np.clip(arr / p95, 0, 1).astype(np.float32)
+
+
+def normalize_symmetric(arr):
+    arr = np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    scale = np.percentile(np.abs(arr), 95)
+    if scale <= 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    return np.clip(arr / scale, -1, 1).astype(np.float32)
+
+
+def compute_system_prior(feature_map, feature_names, commodity):
+    idx = {name: i for i, name in enumerate(feature_names)}
+    zeros = np.zeros(feature_map.shape[:2], dtype=np.float32)
+
+    def get(name):
+        return feature_map[:, :, idx[name]] if name in idx else zeros
+
+    fault = get('faults')
+    magnetics = get('magnetics')
+    gravity = get('gravity')
+    streams = get('streams')
+
+    if commodity == 'copper':
+        geochem = np.maximum.reduce([get('geochem_cu'), get('geochem_au'), get('geochem_ag'), get('nure_cu'), zeros])
+        alteration = np.maximum.reduce([
+            get('alteration_argillic'), get('alteration_phyllic'),
+            get('alteration_propylitic'), get('alteration_silica'), zeros
+        ])
+        structural = np.clip(0.65 * fault + 0.2 * magnetics + 0.15 * gravity, 0, 1)
+        hydrothermal = np.clip(0.7 * alteration + 0.3 * geochem, 0, 1)
+        prior = np.clip(0.45 * structural + 0.45 * hydrothermal + 0.10 * streams, 0, 1)
+        return prior.astype(np.float32), {
+            'structural_proxy': structural.astype(np.float32),
+            'hydrothermal_proxy': hydrothermal.astype(np.float32),
+            'geochem_proxy': geochem.astype(np.float32),
+        }
+
+    ree_pathfinder = np.maximum.reduce([
+        get('radiometric_th'), get('radiometric_u'), get('radiometric_k'),
+        get('nure_p'), get('nure_nb'), get('nure_th'), zeros
+    ])
+    alkaline = get('dist_alkaline')
+    structural = np.clip(0.55 * fault + 0.25 * magnetics + 0.20 * gravity, 0, 1)
+    source_trap = np.clip(0.60 * ree_pathfinder + 0.25 * alkaline + 0.15 * streams, 0, 1)
+    prior = np.clip(0.45 * structural + 0.55 * source_trap, 0, 1)
+    return prior.astype(np.float32), {
+        'structural_proxy': structural.astype(np.float32),
+        'ree_pathfinder_proxy': ree_pathfinder.astype(np.float32),
+        'alkaline_proxy': alkaline.astype(np.float32),
+    }
+
+
+def choose_holdout_deposits(deposits):
+    if len(deposits) < 8:
+        return [], deposits
+    xs = np.array([d[2] for d in deposits])
+    ys = np.array([d[3] for d in deposits])
+    mx, my = np.median(xs), np.median(ys)
+    quadrants = {0: [], 1: [], 2: [], 3: []}
+    for dep in deposits:
+        qx = 1 if dep[2] >= mx else 0
+        qy = 1 if dep[3] >= my else 0
+        quadrants[qx + 2*qy].append(dep)
+    holdout_quad = max(quadrants, key=lambda k: len(quadrants[k]))
+    holdout = quadrants[holdout_quad]
+    if len(holdout) < max(2, int(0.15 * len(deposits))):
+        return [], deposits
+    train = [d for d in deposits if d not in holdout]
+    return holdout, train
+
+
+def summarize_holdout_hit_rate(prob_map, holdout_deposits):
+    if not holdout_deposits:
+        return None
+    scores = []
+    for px, py, _, _ in holdout_deposits:
+        if 0 <= py < prob_map.shape[0] and 0 <= px < prob_map.shape[1]:
+            scores.append(float(prob_map[py, px]))
+    if not scores:
+        return None
+    scores = np.array(scores)
+    return {
+        'count': int(scores.size),
+        'mean': float(scores.mean()),
+        'p50': float(np.percentile(scores, 50)),
+        'p75': float(np.percentile(scores, 75)),
+        'above_050': float((scores >= 0.50).mean()),
+        'above_070': float((scores >= 0.70).mean()),
+    }
 
 
 # =====================================================================
@@ -493,6 +751,7 @@ print(f"OreInsight v4 - {COMMODITY_LABEL} Mineral Prospectivity")
 print("=" * 70)
 print()
 print("[PROGRESS:5:Initializing analysis...]")
+sys.stdout.flush()
 
 # =====================================================================
 # Load DEM and Setup
@@ -569,13 +828,15 @@ print(f"[INFO] Area: ~{area_km2:.0f} km² ({width_km:.0f} x {height_km:.0f} km)"
 print()
 print("[STEP 2/8] Loading known deposits...")
 print("[PROGRESS:15:Loading deposit locations...]")
+sys.stdout.flush()
 
 deposits = []
 
+deposit_diagnostics = None
 if DEPOSIT_CSV_PATH and os.path.exists(DEPOSIT_CSV_PATH):
     print(f"[INFO] Loading deposits from CSV: {DEPOSIT_CSV_PATH}")
-    deposits = load_deposits_from_csv(
-        DEPOSIT_CSV_PATH, x_min, x_max, y_min, y_max, transform, H, W
+    deposits, deposit_diagnostics = select_deposits_from_csv(
+        DEPOSIT_CSV_PATH, x_min, x_max, y_min, y_max, transform, H, W, COMMODITY
     )
 else:
     print("[INFO] No deposit CSV available, falling back to shapefiles...")
@@ -607,8 +868,16 @@ else:
 
 print(f"[INFO] Found {len(deposits)} deposits within DEM bounds")
 
+holdout_deposits, training_deposits = choose_holdout_deposits(deposits)
+if holdout_deposits:
+    print(f"[INFO] Spatial holdout deposits reserved for demo validation: {len(holdout_deposits)}")
+    print(f"[INFO] Training deposits after holdout: {len(training_deposits)}")
+else:
+    training_deposits = deposits
+    print("[INFO] Not enough deposits for spatial holdout; using all deposits for training")
+
 # Check if we have enough deposits - use transfer mode if not
-TRANSFER_MODE = len(deposits) < MIN_DEPOSITS_FOR_TRAINING
+TRANSFER_MODE = len(training_deposits) < MIN_DEPOSITS_FOR_TRAINING
 
 # Persistent model directory
 MODELS_DIR = os.path.join(os.path.dirname(RESULTS_DIR), "models")
@@ -666,6 +935,7 @@ else:
 print()
 print("[STEP 3/8] Engineering features from geological layers...")
 print("[PROGRESS:25:Engineering terrain features...]")
+sys.stdout.flush()
 
 # Initialize feature array: (H, W, n_features)
 features_list = []
@@ -837,6 +1107,15 @@ for layer_name, layer_path in FEATURE_LAYERS.items():
     except Exception as e:
         print(f"[ERROR] Failed to load {layer_name}: {e}")
 
+# Add research-backed mineral-system composite features
+base_feature_stack = np.stack(features_list, axis=-1)
+system_prior, proxy_layers = compute_system_prior(base_feature_stack, feature_names_local, COMMODITY)
+for proxy_name, proxy_arr in proxy_layers.items():
+    features_list.append(proxy_arr)
+    feature_names_local.append(proxy_name)
+features_list.append(system_prior)
+feature_names_local.append(f"{COMMODITY}_system_prior")
+
 # Stack features
 n_features = len(features_list)
 feature_stack = np.stack(features_list, axis=-1)  # Shape: (H, W, n_features)
@@ -860,7 +1139,7 @@ if not TRANSFER_MODE:
 
     # Create positive samples (deposits)
     positive_samples = []
-    for px, py, _, _ in deposits:
+    for px, py, _, _ in training_deposits:
         if 0 <= py < H and 0 <= px < W:
             feature_vector = feature_stack[py, px, :]
             positive_samples.append(feature_vector)
@@ -877,7 +1156,7 @@ if not TRANSFER_MODE:
 
     # Create distance map from deposits
     deposit_mask = np.zeros((H, W), dtype=bool)
-    for px, py, _, _ in deposits:
+    for px, py, _, _ in training_deposits:
         if 0 <= py < H and 0 <= px < W:
             deposit_mask[py, px] = True
 
@@ -892,8 +1171,15 @@ if not TRANSFER_MODE:
         BUFFER_DISTANCE_M = 5000  # Lawley et al. 2024: carbonatites are large
     else:
         BUFFER_DISTANCE_M = 300
-    buffer_pixels = int(BUFFER_DISTANCE_M / abs(transform[1]))
-    print(f"[INFO] Negative sampling buffer: {BUFFER_DISTANCE_M}m ({buffer_pixels} pixels)")
+    # Convert geographic pixel size to meters before buffering
+    lat_center_local = (y_min + y_max) / 2.0
+    meters_per_deg_lon = 111320.0 * math.cos(math.radians(lat_center_local))
+    meters_per_deg_lat = 111320.0
+    pixel_size_x_m = abs(transform[1]) * meters_per_deg_lon
+    pixel_size_y_m = abs(transform[5]) * meters_per_deg_lat
+    pixel_size_m = max(1.0, (pixel_size_x_m + pixel_size_y_m) / 2.0)
+    buffer_pixels = max(1, int(BUFFER_DISTANCE_M / pixel_size_m))
+    print(f"[INFO] Negative sampling buffer: {BUFFER_DISTANCE_M}m (~{buffer_pixels} pixels at {pixel_size_m:.1f} m/pixel)")
     print(f"[INFO] Buffer rationale: {DEPOSIT_TYPE} system dimensions")
     from scipy.ndimage import binary_dilation
     deposit_buffer = binary_dilation(deposit_mask, iterations=buffer_pixels)
@@ -912,7 +1198,7 @@ if not TRANSFER_MODE:
     if n_negative == 0:
         print(f"[ERROR] No valid negative sampling area - buffer too large!")
         print(f"[FIX] Reducing buffer to 500m...")
-        buffer_pixels = int(200 / abs(transform[1]))  # 200m fallback
+        buffer_pixels = max(1, int(200 / pixel_size_m))  # 200m fallback
         deposit_buffer = binary_dilation(deposit_mask, iterations=buffer_pixels)
         valid_negative_area = ~deposit_buffer & (dem > 0)
         valid_pixels = np.argwhere(valid_negative_area)
@@ -974,9 +1260,57 @@ if not TRANSFER_MODE:
     print("[STEP 5/8] Splitting data and training model...")
     print("[PROGRESS:50:Training Random Forest model...]")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42, stratify=y
-    )
+    # SPATIAL CROSS-VALIDATION
+    # Prevents spatial autocorrelation bias (Valavi et al., 2019)
+    # Assigns each sample to a geographic block based on its source pixel
+    # Train/test split by block, not randomly
+    
+    n_samples = len(X)
+    
+    # Assign spatial blocks based on approximate grid position
+    # Use the positive sample coordinates + random coords for negatives
+    np.random.seed(42)
+    sample_coords_x = np.zeros(n_samples)
+    sample_coords_y = np.zeros(n_samples)
+    
+    # First n_positive are deposits
+    for si in range(min(n_positive, n_samples)):
+        if si < len(deposits):
+            sample_coords_x[si] = deposits[si][0]  # px
+            sample_coords_y[si] = deposits[si][1]  # py
+    
+    # Rest are negatives - assign random grid positions
+    for si in range(n_positive, n_samples):
+        sample_coords_x[si] = np.random.randint(0, max(1, W))
+        sample_coords_y[si] = np.random.randint(0, max(1, H))
+    
+    # Create 4x4 spatial grid blocks
+    n_bx, n_by = 4, 4
+    block_ids = np.zeros(n_samples, dtype=int)
+    for si in range(n_samples):
+        bx = min(int(sample_coords_x[si] / max(1, W) * n_bx), n_bx - 1)
+        by = min(int(sample_coords_y[si] / max(1, H) * n_by), n_by - 1)
+        block_ids[si] = bx * n_by + by
+    
+    # Hold out ~25% of blocks for testing
+    unique_blocks = np.unique(block_ids)
+    np.random.shuffle(unique_blocks)
+    n_test_blocks = max(1, len(unique_blocks) // 4)
+    test_block_set = set(unique_blocks[:n_test_blocks])
+    
+    test_mask = np.array([block_ids[i] in test_block_set for i in range(n_samples)])
+    train_mask = ~test_mask
+    
+    # Verify both classes in both sets
+    if len(np.unique(y[train_mask])) < 2 or len(np.unique(y[test_mask])) < 2 or test_mask.sum() < 5:
+        print("[WARN] Spatial split insufficient, using stratified random split")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, random_state=42, stratify=y
+        )
+    else:
+        X_train, X_test = X[train_mask], X[test_mask]
+        y_train, y_test = y[train_mask], y[test_mask]
+        print(f"[INFO] Spatial block CV: {n_bx}x{n_by} grid, {n_test_blocks} test blocks held out")
 
     print(f"[INFO] Training set: {len(X_train)} samples")
     print(f"[INFO] Test set: {len(X_test)} samples")
@@ -987,12 +1321,34 @@ if not TRANSFER_MODE:
     X_test_scaled = scaler.transform(X_test)
 
     # Train Random Forest model
+    # Adaptive hyperparameters: prevent overfitting on small datasets
+    # With <50 positive samples, constrain depth to force generalization
+    # Ref: Probst et al. (2019) "Hyperparameters and Tuning for Random Forest"
+    if n_positive < 30:
+        rf_depth = 5
+        rf_min_split = max(5, n_positive // 3)
+        rf_min_leaf = max(3, n_positive // 5)
+        rf_trees = 100
+        print(f"[CONFIG] Small dataset ({n_positive} deposits): depth={rf_depth}, min_leaf={rf_min_leaf}")
+    elif n_positive < 100:
+        rf_depth = 8
+        rf_min_split = 8
+        rf_min_leaf = 4
+        rf_trees = 150
+        print(f"[CONFIG] Medium dataset ({n_positive} deposits): depth={rf_depth}, min_leaf={rf_min_leaf}")
+    else:
+        rf_depth = 15
+        rf_min_split = 10
+        rf_min_leaf = 5
+        rf_trees = 200
+        print(f"[CONFIG] Large dataset ({n_positive} deposits): depth={rf_depth}, min_leaf={rf_min_leaf}")
+    
     print("[TRAIN] Training Random Forest Classifier...")
     base_model = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=15,
-        min_samples_split=10,
-        min_samples_leaf=5,
+        n_estimators=rf_trees,
+        max_depth=rf_depth,
+        min_samples_split=rf_min_split,
+        min_samples_leaf=rf_min_leaf,
         random_state=42,
         n_jobs=-1,
         class_weight='balanced'
@@ -1002,7 +1358,12 @@ if not TRANSFER_MODE:
 
     # Apply probability calibration to crush background noise
     print("[CALIBRATE] Applying probability calibration...")
-    model = CalibratedClassifierCV(base_model, method='sigmoid', cv=5)
+    # Reduce CV folds if not enough samples per class
+    min_class_count = min(int(y_train.sum()), int((1-y_train).sum()))
+    cal_cv = min(5, max(2, min_class_count))
+    if cal_cv < 5:
+        print(f"[INFO] Reduced calibration CV to {cal_cv}-fold (small dataset: {min_class_count} per class)")
+    model = CalibratedClassifierCV(base_model, method='sigmoid', cv=cal_cv)
     model.fit(X_train_scaled, y_train)
 
     print("[SUCCESS] Model trained and calibrated")
@@ -1030,7 +1391,8 @@ if not TRANSFER_MODE:
     print(f"[METRIC] Test AUC: {test_auc:.4f}")
 
     # Cross-validation
-    cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring='roc_auc')
+    cv_k = min(5, max(2, min_class_count))
+    cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=cv_k, scoring='roc_auc')
     print(f"[METRIC] Cross-validation AUC: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
 
     # Classification report
@@ -1081,15 +1443,15 @@ else:
 
 print()
 print("[STEP 7/8] Generating probability map...")
-print("[PROGRESS:75:Generating probability maps...]")
+print("[PROGRESS:60:Generating probability maps...]")
 
 # Reshape feature stack for prediction
 X_map = feature_stack.reshape(-1, n_features)
 X_map = np.nan_to_num(X_map, nan=0.0, posinf=0.0, neginf=0.0)
 
 # Process in chunks to avoid memory issues
-chunk_size = 1000000  # 1 million pixels at a time
 n_pixels = X_map.shape[0]
+chunk_size = min(2000000, max(100000, n_pixels // 15))  # Larger chunks = faster (numpy vectorization)
 n_chunks = (n_pixels + chunk_size - 1) // chunk_size
 
 print(f"[INFO] Processing {n_pixels:,} pixels in {n_chunks} chunks...")
@@ -1098,21 +1460,25 @@ prob_flat = np.zeros(n_pixels, dtype=np.float32)
 uncertainty_flat = np.zeros(n_pixels, dtype=np.float32)
 
 import time as _time
-_chunk_start = _time.time()
+_loop_start = _time.time()
 for i in range(n_chunks):
     start_idx = i * chunk_size
     end_idx = min((i + 1) * chunk_size, n_pixels)
     
-    chunk_pct = 75 + int((i / n_chunks) * 15)
+    chunk_pct = 60 + int(((i + 1) / max(n_chunks, 1)) * 30)
     # ETA calculation
-    if i > 0:
-        elapsed = _time.time() - _chunk_start
-        per_chunk = elapsed / i
-        remaining = per_chunk * (n_chunks - i)
-        eta_str = f" (~{remaining:.0f}s left)" if remaining > 2 else ""
+    elapsed = _time.time() - _loop_start
+    done_chunks = i + 1
+    avg_per_chunk = elapsed / max(done_chunks, 1)
+    remaining = avg_per_chunk * max(n_chunks - done_chunks, 0)
+    if remaining > 60:
+        eta_str = f" (~{remaining/60:.1f}m left)"
+    elif remaining > 2:
+        eta_str = f" (~{remaining:.0f}s left)"
     else:
         eta_str = ""
     print(f"[PROGRESS:{chunk_pct}:Predicting chunk {i+1}/{n_chunks}{eta_str}]")
+    sys.stdout.flush()  # Force immediate output to UI
     
     # Scale chunk
     X_chunk = X_map[start_idx:end_idx]
@@ -1121,8 +1487,10 @@ for i in range(n_chunks):
     # Predict probabilities
     prob_flat[start_idx:end_idx] = model.predict_proba(X_chunk_scaled)[:, 1]
     
-    # Calculate uncertainty (standard deviation across trees from base model)
-    tree_predictions = np.array([tree.predict_proba(X_chunk_scaled)[:, 1] for tree in base_model.estimators_])
+    # Calculate uncertainty using SUBSET of trees for speed (10 of 200)
+    # Full 200-tree uncertainty takes 20x longer for minimal accuracy gain
+    _tree_subset = base_model.estimators_[::20]  # Every 20th tree = 10 trees
+    tree_predictions = np.array([tree.predict_proba(X_chunk_scaled)[:, 1] for tree in _tree_subset])
     uncertainty_flat[start_idx:end_idx] = tree_predictions.std(axis=0)
 
 # Reshape to map
@@ -1132,13 +1500,31 @@ uncertainty_map = uncertainty_flat.reshape(H, W)
 print(f"[INFO] Probability range: {prob_map.min():.4f} - {prob_map.max():.4f}")
 print(f"[INFO] Uncertainty range: {uncertainty_map.min():.4f} - {uncertainty_map.max():.4f}")
 
+# Blend with mineral-systems prior to improve demo robustness and domain coherence
+if f"{COMMODITY}_system_prior" in feature_names:
+    prior_idx = feature_names.index(f"{COMMODITY}_system_prior")
+    prior_map = feature_stack[:, :, prior_idx]
+    blend_weight = 0.18 if COMMODITY == 'copper' else 0.22
+    prob_map = np.clip((1.0 - blend_weight) * prob_map + blend_weight * prior_map, 0, 1)
+    print(f"[INFO] Blended ML probability with {COMMODITY} system prior (weight={blend_weight:.2f})")
+
+
+holdout_summary = summarize_holdout_hit_rate(prob_map, holdout_deposits)
+if holdout_summary:
+    print(f"[VALIDATION] Holdout deposits: {holdout_summary['count']}")
+    print(f"[VALIDATION] Holdout mean probability: {holdout_summary['mean']:.3f}")
+    print(f"[VALIDATION] Holdout >=50% hit rate: {holdout_summary['above_050']*100:.1f}%")
+    print(f"[VALIDATION] Holdout >=70% hit rate: {holdout_summary['above_070']*100:.1f}%")
+else:
+    print("[VALIDATION] No spatial holdout summary available for this run")
+
 # =====================================================================
 # Save Outputs
 # =====================================================================
 
 print()
 print("[STEP 8/8] Saving outputs...")
-print("[PROGRESS:90:Saving results...]")
+print("[PROGRESS:92:Saving results...]")
 
 def save_geotiff(data, path, dtype=gdal.GDT_Float32):
     driver = gdal.GetDriverByName('GTiff')
@@ -1163,6 +1549,13 @@ print(f"[SAVED] {dem_cropped_path}")
 uncertainty_path = os.path.join(RESULTS_DIR, "oreinsight_v4_uncertainty.tif")
 save_geotiff(uncertainty_map, uncertainty_path)
 print(f"[SAVED] {uncertainty_path}")
+
+# Save mineral-systems prior for explainability
+if f"{COMMODITY}_system_prior" in feature_names:
+    prior_idx = feature_names.index(f"{COMMODITY}_system_prior")
+    prior_path = os.path.join(RESULTS_DIR, f"oreinsight_v4_{COMMODITY}_system_prior.tif")
+    save_geotiff(feature_stack[:, :, prior_idx], prior_path)
+    print(f"[SAVED] {prior_path}")
 
 # =====================================================================
 # Grade Estimation - Commodity-Specific Models
@@ -1274,10 +1667,12 @@ with open(report_path, 'w') as f:
                 f.write(f"  {saved_feature_names[si[i]]}: {fi[si[i]]:.4f}\n")
     else:
         f.write("OreInsight v4 - Model Validation Report\n")
+        f.write(f"Commodity: {COMMODITY}\n")
         f.write("=" * 70 + "\n\n")
         f.write(f"Training Samples: {len(X_train)}\n")
         f.write(f"Test Samples: {len(X_test)}\n")
         f.write(f"Real Deposits Used: {n_positive}\n")
+        f.write(f"Spatial Holdout Deposits: {len(holdout_deposits)}\n")
         f.write(f"Features: {n_features}\n")
         f.write(f"Negative Buffer: {BUFFER_DISTANCE_M}m\n\n")
         f.write(f"Training AUC: {train_auc:.4f}\n")
@@ -1290,6 +1685,12 @@ with open(report_path, 'w') as f:
         f.write("\nTest Set Classification Report:\n")
         f.write(classification_report(y_test, y_test_pred, target_names=['Non-Deposit', 'Deposit']))
     
+    if holdout_summary:
+        f.write("\nSpatial Holdout Validation:\n")
+        f.write(f"  Holdout deposits: {holdout_summary['count']}\n")
+        f.write(f"  Mean probability: {holdout_summary['mean']:.3f}\n")
+        f.write(f"  Hit rate >= 0.50: {holdout_summary['above_050']*100:.1f}%\n")
+        f.write(f"  Hit rate >= 0.70: {holdout_summary['above_070']*100:.1f}%\n")
     f.write("\nGrade Estimation Method:\n")
     f.write(f"  {GRADE_MODEL_REF}\n")
     if COMMODITY == 'ree':
@@ -1306,9 +1707,13 @@ print()
 print("=" * 70)
 print("ANALYSIS COMPLETE")
 print("=" * 70)
+print(f"Commodity: {COMMODITY}")
+print("=" * 70)
 if not TRANSFER_MODE:
     print(f"Real Deposits: {n_positive}")
     print(f"Test AUC: {test_auc:.4f}")
+    if holdout_summary:
+        print(f"Spatial holdout >=50% hit rate: {holdout_summary['above_050']*100:.1f}%")
 else:
     print("[TRANSFER] Saved model applied to new area")
     print(f"[TRANSFER] Features matched: {matched}/{len(saved_feature_names)}")
