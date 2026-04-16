@@ -29,101 +29,97 @@ else:
 
 class ImprovedTerrainStyle(_TerrainStyleBase):
     """
-    Improved camera style with zoom-to-mouse and better controls.
-    Perfect for mining/geological exploration.
+    Improved camera style with reliable zoom-to-cursor behavior.
     """
-    
+
     def __init__(self):
         super().__init__()
+        self.default_renderer = None
         self.AddObserver("InteractionEvent", self.constrain_camera)
         self.AddObserver("MouseWheelForwardEvent", self.zoom_forward)
         self.AddObserver("MouseWheelBackwardEvent", self.zoom_backward)
-        
-        # Smoother interaction settings
-        self.SetMotionFactor(5.0)  # Faster rotation
-        
+        self.SetMotionFactor(5.0)
+
+    def set_default_renderer(self, renderer):
+        self.default_renderer = renderer
+        if hasattr(self, "SetDefaultRenderer"):
+            self.SetDefaultRenderer(renderer)
+
+    def _get_renderer(self):
+        renderer = self.GetCurrentRenderer()
+        if renderer is None:
+            renderer = self.default_renderer
+        return renderer
+
     def zoom_forward(self, obj, event):
         """Zoom in toward mouse position."""
-        self.zoom_to_mouse(1.1)  # 10% closer
-        
+        self.zoom_to_mouse(0.85)
+
     def zoom_backward(self, obj, event):
         """Zoom out from mouse position."""
-        self.zoom_to_mouse(0.9)  # 10% farther
-        
+        self.zoom_to_mouse(1.18)
+
     def zoom_to_mouse(self, factor):
         """Zoom toward/away from mouse cursor position."""
-        renderer = self.GetCurrentRenderer()
-        if not renderer:
-            return
-            
-        camera = renderer.GetActiveCamera()
-        
-        # Get mouse position in display coordinates
+        renderer = self._get_renderer()
         interactor = self.GetInteractor()
+
+        if renderer is None or interactor is None:
+            return
+
+        camera = renderer.GetActiveCamera()
         mouse_pos = interactor.GetEventPosition()
-        
-        # Pick the point under the mouse
-        picker = vtk.vtkWorldPointPicker()
+
+        # Use CellPicker instead of WorldPointPicker. It is much more reliable
+        # for structured terrain grids and actually locks to the surface.
+        picker = vtk.vtkCellPicker()
+        picker.SetTolerance(0.0005)
         picker.Pick(mouse_pos[0], mouse_pos[1], 0, renderer)
-        picked_pos = picker.GetPickPosition()
-        
-        # Get current camera position and focal point
-        cam_pos = list(camera.GetPosition())
-        focal_point = list(camera.GetFocalPoint())
-        
-        # If we picked a valid point, zoom toward it
-        # Otherwise zoom toward current focal point
-        target = picked_pos if picker.GetPickSuccess() else focal_point
-        
-        # Calculate new camera position
-        direction = [
-            cam_pos[0] - target[0],
-            cam_pos[1] - target[1],
-            cam_pos[2] - target[2]
-        ]
-        
-        # Scale the direction by zoom factor
-        new_pos = [
-            target[0] + direction[0] * factor,
-            target[1] + direction[1] * factor,
-            target[2] + direction[2] * factor
-        ]
-        
-        # Update camera
-        camera.SetPosition(new_pos)
-        
-        # Update focal point to follow zoom
-        new_focal = [
-            focal_point[0] + (target[0] - focal_point[0]) * (1 - factor) * 0.5,
-            focal_point[1] + (target[1] - focal_point[1]) * (1 - factor) * 0.5,
-            focal_point[2] + (target[2] - focal_point[2]) * (1 - factor) * 0.5
-        ]
-        camera.SetFocalPoint(new_focal)
-        
+
+        cam_pos = np.array(camera.GetPosition(), dtype=float)
+        focal_point = np.array(camera.GetFocalPoint(), dtype=float)
+
+        if picker.GetCellId() >= 0:
+            target = np.array(picker.GetPickPosition(), dtype=float)
+        else:
+            target = focal_point
+
+        direction = cam_pos - target
+        new_pos = target + direction * factor
+
+        # Prevent degenerate camera collapse onto the target.
+        if np.linalg.norm(new_pos - target) < 1e-6:
+            return
+
+        camera.SetPosition(float(new_pos[0]), float(new_pos[1]), float(new_pos[2]))
+        camera.SetFocalPoint(float(target[0]), float(target[1]), float(target[2]))
+        camera.SetViewUp(0, 0, 1)
+
         renderer.ResetCameraClippingRange()
         interactor.Render()
-    
+
     def constrain_camera(self, obj, event):
         """Constrain camera to prevent flipping upside down."""
-        camera = self.GetCurrentRenderer().GetActiveCamera()
-        
-        # Always keep Z as the up direction
+        renderer = self._get_renderer()
+        if renderer is None:
+            return
+
+        camera = renderer.GetActiveCamera()
+        if camera is None:
+            return
+
         camera.SetViewUp(0, 0, 1)
-        
-        # Constrain elevation to prevent going completely upside down
+
         pos = camera.GetPosition()
         focal = camera.GetFocalPoint()
-        
-        # Calculate elevation angle
+
         dx = pos[0] - focal[0]
         dy = pos[1] - focal[1]
         dz = pos[2] - focal[2]
-        
-        # Prevent camera from going below the terrain (negative Z relative to focal point)
-        if dz < 0.1:  # Minimum height above terrain
-            # Adjust camera position to maintain minimum elevation
+
+        if dz < 0.1:
             distance = (dx*dx + dy*dy + dz*dz)**0.5
-            new_z = focal[2] + 0.1 * distance
+            new_z = focal[2] + 0.1 * max(distance, 1.0)
             camera.SetPosition(pos[0], pos[1], new_z)
 
 
@@ -157,6 +153,7 @@ class Terrain3DViewer(QtWidgets.QWidget):
             
             # Use improved camera style with zoom-to-mouse
             self.camera_style = ImprovedTerrainStyle()
+            self.camera_style.set_default_renderer(self.renderer)
             self.interactor.SetInteractorStyle(self.camera_style)
             self.interactor.Initialize()
             
@@ -443,44 +440,34 @@ class Terrain3DViewer(QtWidgets.QWidget):
                 lut.Build()
                 mapper.SetLookupTable(lut)
                 
-                # Create modern scalar bar showing only the colored range
+                # Scalar bar legend
                 scalar_bar = vtk.vtkScalarBarActor()
                 scalar_bar.SetLookupTable(lut)
-                scalar_bar.SetTitle("High-Priority\nTargets")
-                scalar_bar.SetNumberOfLabels(6)
+                scalar_bar.SetTitle("Prospectivity")
+                scalar_bar.SetNumberOfLabels(5)
+                scalar_bar.SetWidth(0.08)
+                scalar_bar.SetHeight(0.6)
+                scalar_bar.SetPosition(0.90, 0.20)
                 
-                # Position and size
-                scalar_bar.SetWidth(0.15)
-                scalar_bar.SetHeight(0.75)
-                scalar_bar.SetPosition(0.83, 0.12)
-                
-                # Modern title styling
                 title_prop = scalar_bar.GetTitleTextProperty()
-                title_prop.SetColor(1.0, 1.0, 1.0)
-                title_prop.SetFontSize(18)
+                title_prop.SetColor(0.08, 0.63, 0.52)
+                title_prop.SetFontSize(14)
                 title_prop.SetBold(True)
                 title_prop.SetFontFamilyToArial()
-                title_prop.SetJustificationToCentered()
                 
-                # Modern label styling
                 label_prop = scalar_bar.GetLabelTextProperty()
-                label_prop.SetColor(1.0, 1.0, 1.0)
-                label_prop.SetFontSize(16)
-                label_prop.SetBold(False)
+                label_prop.SetColor(0.85, 0.85, 0.85)
+                label_prop.SetFontSize(12)
                 label_prop.SetFontFamilyToArial()
                 
-                # Format as whole numbers with % sign
                 scalar_bar.SetLabelFormat("%.0f%%")
-                
-                # Position labels to the right of the bar
                 scalar_bar.SetTextPositionToSucceedScalarBar()
-                
                 scalar_bar.VisibilityOn()
                 
                 self.renderer.AddActor2D(scalar_bar)
                 self.scalar_bar = scalar_bar
                 
-                print(f"[3D] Added professional color legend: {prob_min:.1f}% to {prob_max:.1f}%")
+                print(f"[3D] Legend: {prob_min:.1f}% to {prob_max:.1f}%")
             
             # Create actor
             self.actor = vtk.vtkActor()
@@ -701,7 +688,10 @@ class Terrain3DViewer(QtWidgets.QWidget):
                             print(f"[3D] Using fallback grade estimate: {grade:.2f}% Cu")
                     else:
                         # Estimate grade from probability if grade data not available
-                        grade = probability * 2.5  # Typical porphyry copper grade range
+                        if self.commodity == "ree":
+                            grade = probability * 10.0  # Carbonatite REE: 0-10% TREO
+                        else:
+                            grade = probability * 2.5  # Typical porphyry copper grade range
                         print(f"[3D] No grade data, estimated from probability: {grade:.2f}% Cu")
                     
                     # Convert to real-world coordinates
@@ -884,23 +874,29 @@ class Terrain3DViewer(QtWidgets.QWidget):
             prob_text = "LOW"
             prob_desc = "Not recommended"
         
-        # Grade assessment
-        if grade > 1.0:
-            grade_icon = "💎"
-            grade_text = "HIGH GRADE"
-            grade_desc = "Potentially economic"
-        elif grade > 0.5:
-            grade_icon = "⚡"
-            grade_text = "ECONOMIC GRADE"
-            grade_desc = "Worth investigating"
-        elif grade > 0.3:
-            grade_icon = "📊"
-            grade_text = "MARGINAL GRADE"
-            grade_desc = "May be economic at scale"
+        # Grade assessment (commodity-specific thresholds)
+        if self.commodity == "ree":
+            if grade > 5.0:
+                grade_icon, grade_text, grade_desc = "💎", "HIGH GRADE REE", "Exceptional TREO"
+            elif grade > 2.0:
+                grade_icon, grade_text, grade_desc = "⚡", "ECONOMIC REE", "LREE (La, Ce, Pr, Nd)"
+            elif grade > 1.0:
+                grade_icon, grade_text, grade_desc = "📊", "MARGINAL REE", "May be economic"
+            else:
+                grade_icon, grade_text, grade_desc = "⬇️", "SUB-ECONOMIC", "Below REE cutoff"
         else:
-            grade_icon = "⬇️"
-            grade_text = "SUB-ECONOMIC"
-            grade_desc = "Below typical cutoff"
+            if grade > 1.0:
+                grade_icon, grade_text, grade_desc = "💎", "HIGH GRADE", "Potentially economic"
+            elif grade > 0.5:
+                grade_icon, grade_text, grade_desc = "⚡", "ECONOMIC GRADE", "Worth investigating"
+            elif grade > 0.3:
+                grade_icon, grade_text, grade_desc = "📊", "MARGINAL GRADE", "May be economic at scale"
+            else:
+                grade_icon, grade_text, grade_desc = "⬇️", "SUB-ECONOMIC", "Below typical cutoff"
+        
+        # Commodity-aware labels
+        prob_label = "REE PROBABILITY" if self.commodity == "ree" else "COPPER PROBABILITY"
+        grade_unit = "% TREO" if self.commodity == "ree" else "% Cu"
         
         info_html = f"""
 <div style='font-family: Segoe UI, Arial; line-height: 1.6;'>
@@ -909,25 +905,27 @@ class Terrain3DViewer(QtWidgets.QWidget):
 <b style='color: #14a085;'>⛰️ TERRAIN</b><br>
 <span style='color: #d4d4d4;'>Elevation:</span> <b>{elevation:.1f} m</b> ({elevation*3.28084:.0f} ft)<br>
 <br>
-<b style='color: #14a085;'>🎲 COPPER PROBABILITY</b><br>
+<b style='color: #14a085;'>🎲 {prob_label}</b><br>
 <span style='font-size: 14pt;'>{prob_icon} <b style='color: {prob_color};'>{probability*100:.1f}%</b> - {prob_text}</span><br>
 <span style='color: #999;'>{prob_desc}</span><br>
 <br>
 <b style='color: #14a085;'>💰 ESTIMATED GRADE</b><br>
-<span style='font-size: 14pt;'>{grade_icon} <b>{grade:.2f}% Cu</b> - {grade_text}</span><br>
+<span style='font-size: 14pt;'>{grade_icon} <b>{grade:.2f}{grade_unit}</b> - {grade_text}</span><br>
 <span style='color: #999;'>{grade_desc}</span><br>
 """
         
+        target_msg = "This location shows strong potential for REE (La, Ce, Pr, Nd) mineralization in carbonatite-type host rocks." if self.commodity == "ree" else "This location shows strong potential for copper mineralization. Recommended for immediate exploration."
+        
         # Economic viability
         if probability > 0.7 and grade > 0.5:
-            info_html += """<br>
+            info_html += f"""<br>
 <div style='background-color: #1e4d2b; border-left: 4px solid #14a085; padding: 10px; border-radius: 4px;'>
 <b style='color: #14a085; font-size: 12pt;'>🎯 PRIORITY DRILLING TARGET</b><br>
-<span style='color: #d4d4d4;'>This location shows strong potential for copper mineralization. Recommended for immediate exploration.</span>
+<span style='color: #d4d4d4;'>{target_msg}</span>
 </div>
 """
         elif probability > 0.5 and grade > 0.3:
-            info_html += """<br>
+            info_html += f"""<br>
 <div style='background-color: #4d3d1e; border-left: 4px solid #ffaa00; padding: 10px; border-radius: 4px;'>
 <b style='color: #ffaa00; font-size: 12pt;'>✅ RECOMMENDED FOR INVESTIGATION</b><br>
 <span style='color: #d4d4d4;'>Moderate potential. Consider for follow-up sampling or geophysical surveys.</span>
@@ -1056,5 +1054,3 @@ class Terrain3DViewer(QtWidgets.QWidget):
             self.exag_title_label.setStyleSheet(f"color: {accent}; font-size: 10px; font-weight: 600;")
         if hasattr(self, "exag_label"):
             self.exag_label.setStyleSheet(f"color: {accent}; font-size: 10px; font-weight: 600;")
-
-
